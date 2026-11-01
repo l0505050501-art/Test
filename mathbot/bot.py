@@ -19,7 +19,7 @@ from .config import load_env
 from .engine import BOOKS, DIAG_CHUNK, Settings, Store, Trainer
 from .lessons import LESSONS
 from .profile import P
-from .tasks import ALL_TOPICS, TOPICS, Task
+from .tasks import ALL_TOPICS, TAG_THEORY, TOPICS, Task
 
 log = logging.getLogger("mathbot")
 
@@ -443,7 +443,14 @@ async def handle_answer(ctx, chat: int, sid: int, text: str, now: float, idk: bo
         await ctx.bot.send_message(chat, msg)
     else:
         msg = ("Ничего страшного, разберём. " if idk else "❌ Не совсем. ") + f"Правильный ответ: {res.task.correct_display()}\n💡 {res.task.explanation}"
-        if res.hint:
+        theory = ""
+        if res.teach is None and tr.session(sid)["kind"] != "diagnostic":      # на срезе знаний не учим посреди темы
+            known = res.tag in TAG_THEORY
+            if tr.theory_first_time(sid, res.tag if known else res.task.topic):
+                theory = stories.micro_theory(res.task.topic, res.tag if known else None, res.task.theory)
+        if theory:
+            msg += f"\n\n{theory}"                                              # теория именно на эту ошибку, 2–3 строки
+        elif res.hint:
             msg += f"\n⚠️ {res.hint}"
         markup = Markup([[Btn("🤖 Объясни по-другому", callback_data=f"ai:{res.aid}")]]) if ai.enabled() else None
         await ctx.bot.send_message(chat, msg, reply_markup=markup)

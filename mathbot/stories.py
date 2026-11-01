@@ -173,6 +173,19 @@ S: dict[str, tuple] = {
     ),
 }
 
+def micro_theory(topic: str, tag: str | None = None, task_theory: str = "") -> str:
+    """Самая короткая теория (2–3 строки): на конкретную ошибку, иначе — главное правило темы."""
+    from .tasks import TAG_THEORY
+    if task_theory:
+        return task_theory
+    if tag in TAG_THEORY:
+        return TAG_THEORY[tag]
+    if topic in S:
+        return "🧠 Запомни: " + S[topic][0]
+    lines = [l.strip() for l in LESSONS.get(topic, "").splitlines() if l.strip() and not l.strip().startswith("📖")]
+    return ("🧠 Запомни: " + " ".join(lines[:2])[:420]) if lines else ""
+
+
 THEMES = {"boy": 2, "girl": 3}
 GENDER_WORDS = {"boy": "мальчик", "girl": "девочка", "none": "не указан"}
 

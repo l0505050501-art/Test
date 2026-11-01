@@ -114,7 +114,7 @@ def _gen(q_list: list[dict], topic: str, level: int):
             value = list(q["answer"])
         else:
             value = [q["answer"]] + list(q.get("accept", []))
-        return T.Task(topic, level, q["text"], kind, value, q["explanation"], tuple(q.get("buttons", ())))
+        return T.Task(topic, level, q["text"], kind, value, q["explanation"], tuple(q.get("buttons", ())), theory=q.get("theory", ""))
     return gen
 
 

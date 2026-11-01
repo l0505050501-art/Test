@@ -1,0 +1,11 @@
+{
+ "country": "Россия",
+ "school_style": "старая",
+ "subject_nom": "русский язык",
+ "subject_gen": "русского языка",
+ "subject_dat": "русскому языку",
+ "subject_acc": "русский язык",
+ "grade_gen": "6 класса",
+ "foundation_label": "5 класс",
+ "pack": "packs/russian-6.json"
+}

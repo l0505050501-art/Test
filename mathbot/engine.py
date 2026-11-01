@@ -480,6 +480,14 @@ class Trainer:
     def active_session(self):
         return self.s.one("SELECT * FROM sessions WHERE status='active' ORDER BY id DESC LIMIT 1")
 
+    def theory_first_time(self, sid: int, key: str) -> bool:
+        """Мини-теорию на одну и ту же ошибку показываем один раз за занятие — иначе это нудно."""
+        k = f"theory_{sid}_{key}"
+        if self.s.get(k):
+            return False
+        self.s.set(k, "1")
+        return True
+
     def take_lesson(self, topic: str) -> bool:
         """True один раз для каждой темы: перед первым заданием показываем мини-урок."""
         key = f"lesson_seen_{topic}"

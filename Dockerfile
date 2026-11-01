@@ -3,5 +3,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY mathbot ./mathbot
+COPY packs ./packs
+COPY profile*.json ./
 ENV PYTHONUNBUFFERED=1 DB_PATH=/data/mathbot.db
 CMD ["python", "-m", "mathbot"]
