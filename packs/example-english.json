@@ -1,0 +1,40 @@
+{
+  "id": "example-english-5",
+  "title": "ПРИМЕР формата: английский, 5 класс (2 темы)",
+  "topics": {
+    "to_be": "Глагол to be (am / is / are)",
+    "plurals": "Множественное число существительных"
+  },
+  "books": {"spotlight": "Spotlight", "happy": "Happy English", "other": "Другой"},
+  "lessons": {
+    "to_be": "📖 Глагол to be\n\nI — am, he / she / it — is, we / you / they — are.\nI am a pupil. She is my sister. They are happy.\nСокращения: I'm, he's, we're.",
+    "plurals": "📖 Множественное число\n\nОбычно добавляем -s: cat → cats.\nПосле s, x, ch, sh добавляем -es: box → boxes, watch → watches.\nИсключения нужно запомнить: child → children, man → men, woman → women, foot → feet, mouse → mice."
+  },
+  "questions": [
+    {"topic": "to_be", "level": 1, "kind": "text", "text": "I ___ a pupil. (am / is / are)", "answer": "am", "buttons": ["am", "is", "are"], "explanation": "С местоимением I всегда am."},
+    {"topic": "to_be", "level": 1, "kind": "text", "text": "She ___ my sister. (am / is / are)", "answer": "is", "buttons": ["am", "is", "are"], "explanation": "С he / she / it используем is."},
+    {"topic": "to_be", "level": 1, "kind": "text", "text": "They ___ happy. (am / is / are)", "answer": "are", "buttons": ["am", "is", "are"], "explanation": "С we / you / they используем are."},
+    {"topic": "to_be", "level": 1, "kind": "text", "text": "He ___ at school. (am / is / are)", "answer": "is", "buttons": ["am", "is", "are"], "explanation": "He — значит is."},
+    {"topic": "to_be", "level": 1, "kind": "text", "text": "We ___ friends. (am / is / are)", "answer": "are", "buttons": ["am", "is", "are"], "explanation": "We — значит are."},
+    {"topic": "to_be", "level": 1, "kind": "text", "text": "It ___ a cat. (am / is / are)", "answer": "is", "buttons": ["am", "is", "are"], "explanation": "It — значит is."},
+    {"topic": "to_be", "level": 2, "kind": "text", "text": "My parents ___ doctors. (is / are)", "answer": "are", "buttons": ["is", "are"], "explanation": "Parents — это они (they), значит are."},
+    {"topic": "to_be", "level": 2, "kind": "text", "text": "The cat ___ on the sofa. (is / are)", "answer": "is", "buttons": ["is", "are"], "explanation": "Cat — один предмет (it), значит is."},
+    {"topic": "to_be", "level": 2, "kind": "text", "text": "Tom and Ann ___ in the park. (is / are)", "answer": "are", "buttons": ["is", "are"], "explanation": "Tom and Ann — двое (they), значит are."},
+    {"topic": "to_be", "level": 2, "kind": "text", "text": "My brother ___ ten. (is / are)", "answer": "is", "buttons": ["is", "are"], "explanation": "Brother — один человек (he), значит is."},
+    {"topic": "to_be", "level": 3, "kind": "text", "text": "Напиши по-английски: Я дома. (три слова)", "answer": "I am at home", "accept": ["I'm at home"], "explanation": "Я = I, дома = at home, быть = am: I am at home."},
+    {"topic": "to_be", "level": 3, "kind": "text", "text": "Напиши по-английски: Он в школе. (четыре слова)", "answer": "He is at school", "accept": ["He's at school"], "explanation": "He is at school."},
+    {"topic": "to_be", "level": 3, "kind": "text", "text": "Напиши по-английски: Мы друзья. (три слова)", "answer": "We are friends", "accept": ["We're friends"], "explanation": "We are friends."},
+    {"topic": "plurals", "level": 1, "kind": "text", "text": "one cat — two ___", "answer": "cats", "explanation": "Добавляем -s: cats."},
+    {"topic": "plurals", "level": 1, "kind": "text", "text": "one dog — two ___", "answer": "dogs", "explanation": "Добавляем -s: dogs."},
+    {"topic": "plurals", "level": 1, "kind": "text", "text": "one book — two ___", "answer": "books", "explanation": "Добавляем -s: books."},
+    {"topic": "plurals", "level": 1, "kind": "text", "text": "one pen — two ___", "answer": "pens", "explanation": "Добавляем -s: pens."},
+    {"topic": "plurals", "level": 2, "kind": "text", "text": "one box — two ___", "answer": "boxes", "explanation": "После x добавляем -es: boxes."},
+    {"topic": "plurals", "level": 2, "kind": "text", "text": "one bus — two ___", "answer": "buses", "explanation": "После s добавляем -es: buses."},
+    {"topic": "plurals", "level": 2, "kind": "text", "text": "one watch — two ___", "answer": "watches", "explanation": "После ch добавляем -es: watches."},
+    {"topic": "plurals", "level": 2, "kind": "text", "text": "one dish — two ___", "answer": "dishes", "explanation": "После sh добавляем -es: dishes."},
+    {"topic": "plurals", "level": 3, "kind": "text", "text": "one child — two ___", "answer": "children", "explanation": "Исключение: child → children."},
+    {"topic": "plurals", "level": 3, "kind": "text", "text": "one man — two ___", "answer": "men", "explanation": "Исключение: man → men."},
+    {"topic": "plurals", "level": 3, "kind": "text", "text": "one foot — two ___", "answer": "feet", "explanation": "Исключение: foot → feet."},
+    {"topic": "plurals", "level": 3, "kind": "text", "text": "one mouse — two ___", "answer": "mice", "explanation": "Исключение: mouse → mice."}
+  ]
+}
