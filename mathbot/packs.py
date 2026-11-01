@@ -8,6 +8,9 @@
   "prereq": {"to_be": ["alphabet"]},                # необязательно
   "books": {"spotlight": "Spotlight"},              # необязательно
   "lessons": {"to_be": "📖 Глагол to be ..."},      # мини-урок на каждую тему
+  "stories": {"to_be": {"rule": "...", "steps": "1) ... 2) ...",       # необязательно: «исследование» для ребёнка
+              "boy": {"hook": "образ из игр и техники", "example": "..."},
+              "girl": {"hook": "образ из творчества и быта", "example": "..."}}},
   "questions": [ {"topic": "to_be", "level": 1, "text": "I ___ a pupil. (am/is/are)", "kind": "text",
                   "answer": "am", "accept": [], "explanation": "...", "buttons": ["am", "is", "are"]} ]
 }
@@ -21,6 +24,7 @@ import random
 from fractions import Fraction
 
 from . import lessons as lessons_mod
+from . import stories
 from . import tasks as T
 from .engine import BOOKS
 
@@ -46,6 +50,16 @@ def validate(pack: dict) -> tuple[list[str], list[str]]:
         for p in pre:
             if p not in found:
                 errors.append(f"prereq: {p} должна быть в «foundation_topics»")
+    for k, st in (pack.get("stories") or {}).items():
+        if k not in allt:
+            errors.append(f"stories: неизвестная тема {k}")
+            continue
+        for f in ("rule", "steps"):
+            if not str(st.get(f, "")).strip():
+                errors.append(f"stories.{k}: нет поля {f}")
+        for g in ("boy", "girl"):
+            if not (isinstance(st.get(g), dict) and str(st[g].get("hook", "")).strip() and str(st[g].get("example", "")).strip()):
+                errors.append(f"stories.{k}.{g}: нужны поля hook и example")
     seen: set[str] = set()
     counts: dict[tuple[str, int], int] = {}
     for i, q in enumerate(pack.get("questions") or []):
@@ -106,7 +120,7 @@ def _gen(q_list: list[dict], topic: str, level: int):
 
 def snapshot() -> dict:
     return {"T": copy.deepcopy((T.TOPICS, T.TOPICS5, T.PREREQ)), "G": {k: dict(v) for k, v in T.GENERATORS.items()},
-            "L": dict(lessons_mod.LESSONS), "B": dict(BOOKS)}
+            "L": dict(lessons_mod.LESSONS), "B": dict(BOOKS), "S": dict(stories.S)}
 
 
 def restore(s: dict) -> None:
@@ -116,6 +130,7 @@ def restore(s: dict) -> None:
     T.GENERATORS.clear(); T.GENERATORS.update(s["G"])
     lessons_mod.LESSONS.clear(); lessons_mod.LESSONS.update(s["L"])
     BOOKS.clear(); BOOKS.update(s["B"])
+    stories.S.clear(); stories.S.update(s["S"])
 
 
 def apply(pack: dict, replace: bool = True) -> None:
@@ -124,7 +139,7 @@ def apply(pack: dict, replace: bool = True) -> None:
     if errors:
         raise ValueError("Пакет заданий содержит ошибки:\n- " + "\n- ".join(errors))
     if replace:
-        for d in (T.TOPICS, T.TOPICS5, T.PREREQ, T.GENERATORS, lessons_mod.LESSONS):
+        for d in (T.TOPICS, T.TOPICS5, T.PREREQ, T.GENERATORS, lessons_mod.LESSONS, stories.S):
             d.clear()
     T.TOPICS.update(pack["topics"])
     T.TOPICS5.update(pack.get("foundation_topics") or {})
@@ -133,6 +148,8 @@ def apply(pack: dict, replace: bool = True) -> None:
         T.PREREQ.setdefault(k, [])
     T.ALL_TOPICS.clear(); T.ALL_TOPICS.update({**T.TOPICS, **T.TOPICS5})
     lessons_mod.LESSONS.update(pack.get("lessons") or {})
+    for k, st in (pack.get("stories") or {}).items():
+        stories.S[k] = (st["rule"], st["steps"], (st["boy"]["hook"], st["boy"]["example"]), (st["girl"]["hook"], st["girl"]["example"]))
     if pack.get("books"):
         BOOKS.clear(); BOOKS.update(pack["books"]); BOOKS.setdefault("unknown", "не знаю / другой")
     by: dict[tuple[str, int], list[dict]] = {}

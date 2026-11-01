@@ -13,7 +13,7 @@ from telegram import InlineKeyboardMarkup as Markup
 from telegram import Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from . import ai, mailer, packs, report
+from . import ai, mailer, packs, report, stories
 from . import profile as profile_mod
 from .config import load_env
 from .engine import BOOKS, DIAG_CHUNK, Settings, Store, Trainer
@@ -62,8 +62,10 @@ def question_markup(row, task: Task, diagnostic: bool) -> Markup:
     if task.buttons:
         rows.append([Btn(b, callback_data=f"ans:{row['id']}:{b}") for b in task.buttons])
     extra = [Btn("🤷 Не знаю", callback_data=f"idk:{row['id']}")]
-    if not diagnostic:
-        extra.append(Btn("📖 Правило", callback_data=f"rule:{row['id']}"))
+    if row["tag"] != "check":
+        extra.append(Btn("📚 Не проходили", callback_data=f"nc:{row['id']}"))
+        if not diagnostic:
+            extra.append(Btn("📖 Правило", callback_data=f"rule:{row['id']}"))
     rows.append(extra)
     return Markup(rows)
 
@@ -72,23 +74,40 @@ async def send_question(ctx, chat: int, sid: int, row) -> None:
     tr = T(ctx)
     task = Task.load(row["task_json"])
     diag = tr.session(sid)["kind"] == "diagnostic"
-    head = f"Задание {row['seq']}" + (f" из {DIAG_CHUNK}" if diag else "") + ("  🔁 повторение" if row["tag"] == "review" else "")
+    head = ("✅ Проверь себя" if row["tag"] == "check" else
+            f"Задание {row['seq']}" + (f" из {DIAG_CHUNK}" if diag else "") + ("  🔁 повторение" if row["tag"] == "review" else ""))
     await ctx.bot.send_message(chat, f"{head}\n\n{task.text}", reply_markup=question_markup(row, task, diag))
+
+
+async def send_story(ctx, chat: int, sid: int, trow, variant: int = 1, extra: str = "") -> None:
+    """«Исследование»: объяснение темы образами из мира ребёнка."""
+    tr = T(ctx)
+    topic = trow["topic"]
+    if variant == 1:
+        intro = ("📚 Эту тему в школе ещё не проходили — это нормально! Давай познакомимся с ней.\n\n" if trow["reason"] == "nc" else
+                 "🧭 Давай разберём тему, где было непросто. Это как найти секрет игры: один раз понял — и дальше легко.\n\n")
+        tr.teach_start(sid, trow["id"])
+    else:
+        intro = ""
+    await ctx.bot.send_message(chat, intro + stories.render(topic, tr.gender(), variant, extra))
 
 
 async def send_next(ctx, chat: int, sid: int) -> None:
     tr = T(ctx)
     now = time.time()
-    if tr.should_finish(sid, now):
-        await finish_session(ctx, chat, sid)
-        return
+    if not tr.teach_open(sid):
+        due = tr.teach_due(sid, now)
+        if due:                                    # сначала объясняем, потом проверяем
+            await send_story(ctx, chat, sid, due)
+        elif tr.should_finish(sid, now):
+            await finish_session(ctx, chat, sid)
+            return
     row = tr.next_question(sid, now)
     if row is None:
         await finish_session(ctx, chat, sid)
         return
-    if tr.session(sid)["kind"] == "daily" and row["tag"] is None and tr.take_lesson(row["topic"]):
-        await ctx.bot.send_message(chat, "Новая тема! Сначала короткое напоминание правила.\n\n" + LESSONS[row["topic"]])
-        tr.s.run("UPDATE answers SET sent_at=? WHERE id=?", (time.time(), row["id"]))   # время на чтение правила не считаем
+    if row["tag"] == "check":                      # время на чтение объяснения не считаем
+        tr.s.run("UPDATE answers SET sent_at=? WHERE id=?", (time.time(), row["id"]))
     await send_question(ctx, chat, sid, row)
 
 
@@ -105,6 +124,13 @@ async def finish_session(ctx, chat: int, sid: int) -> None:
     if cfg["correct"]:
         ans, bonus = tr.session_earned(sid)
         msg += f"\n💰 Заработано: {tr.fmt(ans + bonus)}" + (f" (в том числе бонус за полное занятие: {tr.fmt(bonus)})" if bonus else "") + f"\nВ кошельке: {tr.fmt(tr.balance())}. Покажи маме!"
+    tp = tr.teach_report(sid)
+    if tp["ok"]:
+        msg += "\n\n✅ Разобрали и поняли: " + "; ".join(ALL_TOPICS[t] for t in tp["ok"])
+    if tp["help"]:
+        msg += "\n🤝 Попроси маму или папу посидеть с тобой над темой: " + "; ".join(ALL_TOPICS[t] for t in tp["help"])
+    if tp["queued"]:
+        msg += "\n📚 Разберём в следующий раз: " + "; ".join(ALL_TOPICS[t] for t in tp["queued"][:3])
     if streak > 1:
         msg += f"\n🔥 Занимаешься уже {streak} дн. подряд!"
     reward = tr.reward_due(sid)
@@ -122,7 +148,9 @@ async def begin(ctx, chat: int, sid: int, minutes: int | None = None) -> None:
     if s["kind"] == "diagnostic":
         done = sum(1 for c in tr.diag_counts().values() if c >= 3)
         intro = (f"Сегодня небольшая проверка: посмотрим, что ты уже знаешь по темам {P.grade_gen} (тем проверено: {done} из {len(TOPICS)}). "
-                 f"Ошибаться можно — это нужно только чтобы понять, с чего начать. Всё устно, калькулятор не нужен. Заданий: {DIAG_CHUNK}.")
+                 f"Ошибаться можно — это нужно только чтобы понять, с чего начать. Всё устно, калькулятор не нужен. Заданий: {DIAG_CHUNK}.\n"
+                 "Если тему ещё не проходили — жми «📚 Не проходили». Если не знаешь — «🤷 Не знаю». Это совсем не страшно: "
+                 "после проверки я объясню всё, что было трудно.")
     else:
         intro = f"Поехали! Примерно {tr.minutes_for(s)} мин. устного счёта."
         days = tr.days_to_test(time.time())
@@ -135,7 +163,10 @@ async def begin(ctx, chat: int, sid: int, minutes: int | None = None) -> None:
 
 # ------------------------------------------------------------------ школа: учебник, тема, контрольная
 async def ask_school(ctx, chat: int, what: str) -> None:
-    if what == "book":
+    if what == "gender":
+        rows = [[Btn("👦 Мальчик", callback_data="gd:boy"), Btn("👧 Девочка", callback_data="gd:girl")], [Btn("Не скажу", callback_data="gd:none")]]
+        await ctx.bot.send_message(chat, "Давай познакомимся! Ты мальчик или девочка? Так мне будет проще объяснять тебе на понятных примерах.", reply_markup=Markup(rows))
+    elif what == "book":
         keys = list(BOOKS)
         rows = [[Btn(BOOKS[k], callback_data=f"bk:{k}") for k in keys[i:i + 2]] for i in range(0, len(keys), 2)]
         await ctx.bot.send_message(chat, f"Расскажи про школу 🙂 Какой у тебя учебник по {P.subject_dat}? (посмотри на обложку)", reply_markup=Markup(rows))
@@ -241,6 +272,7 @@ HELP_PARENT = (
     "/stats — итоги недели, уровень по темам и совет\n"
     "/settime 17:30 — во сколько присылать задания\n"
     "/name Маша — имя ученика в отчётах\n"
+    "/gender мальчик — пол ученика (образы в объяснениях: техника и игры / творчество и быт)\n"
     "/book Виленкин — учебник (если ученик не ответил)\n"
     "/school проценты — какую тему проходят в школе\n"
     "/test 20.11 — дата контрольной (/test нет — убрать)\n"
@@ -329,9 +361,11 @@ async def on_callback(update: Update, ctx) -> None:
             tr.decline(s["id"], now)
             await ctx.bot.send_message(chat, "Хорошо, сегодня пропускаем. Но завтра — обязательно! Если передумаешь, нажми /go.")
             await send_report(ctx, s["id"])
-    elif data[:3] in ("bk:", "st:", "tt:"):
+    elif data[:3] in ("gd:", "bk:", "st:", "tt:"):
         key = data[3:]
-        if data.startswith("bk:"):
+        if data.startswith("gd:"):
+            tr.set_gender(key)
+        elif data.startswith("bk:"):
             tr.set_book(key)
         elif data.startswith("st:"):
             tr.set_school_topic(key, now)
@@ -342,7 +376,7 @@ async def on_callback(update: Update, ctx) -> None:
         await ctx.bot.send_message(chat, "Записал(а) 👍")
         if ctx.application.bot_data.pop("chain", False):
             await go(ctx, chat)
-    elif data.startswith(("ans:", "idk:", "rule:", "ai:")):
+    elif data.startswith(("ans:", "idk:", "nc:", "rule:", "ai:")):
         kind, aid, *rest = data.split(":", 2)
         if kind == "ai":
             row = tr.s.one("SELECT * FROM answers WHERE id=?", (int(aid),))
@@ -361,19 +395,23 @@ async def on_callback(update: Update, ctx) -> None:
             await ctx.bot.send_message(chat, LESSONS[row["topic"]])
             return
         await q.edit_message_reply_markup(None)
-        await handle_answer(ctx, chat, s["id"], rest[0] if rest else "", now, idk=(kind == "idk"))
+        await handle_answer(ctx, chat, s["id"], rest[0] if rest else "", now, idk=(kind == "idk"), nc=(kind == "nc"))
 
 
-async def handle_answer(ctx, chat: int, sid: int, text: str, now: float, idk: bool = False) -> None:
+async def handle_answer(ctx, chat: int, sid: int, text: str, now: float, idk: bool = False, nc: bool = False) -> None:
     tr = T(ctx)
-    res = tr.give_up(sid, now) if idk else tr.submit(sid, text, now)
+    res = tr.not_covered(sid, now) if nc else tr.give_up(sid, now) if idk else tr.submit(sid, text, now)
     if res.task is None:
         return
     if res.ok is None:
         await ctx.bot.send_message(chat, f"🤔 {res.bad}")
         return
-    if res.ok:
+    if res.nc:
+        await ctx.bot.send_message(chat, "📚 Понятно, эту тему ещё не проходили. Это нормально, ничего не потеряно!")
+    elif res.ok:
         msg = random.choice(PRAISE) + (f"  +{tr.fmt(res.money)}" if res.money else f"  +{res.xp}")
+        if res.teach == "understood":
+            msg += f"\n🎉 Ты понял(а)! Ступенька пройдена: {ALL_TOPICS[res.task.topic]} {tr.stars(res.task.topic)}"
         if res.mastered:
             msg += f"\n🏅 Тема «{ALL_TOPICS[res.mastered]}» освоена!" + (f" Бонус: {tr.fmt(tr.money_cfg()['master'])}" if tr.money_cfg()["correct"] else "")
         await ctx.bot.send_message(chat, msg)
@@ -383,8 +421,14 @@ async def handle_answer(ctx, chat: int, sid: int, text: str, now: float, idk: bo
             msg += f"\n⚠️ {res.hint}"
         markup = Markup([[Btn("🤖 Объясни по-другому", callback_data=f"ai:{res.aid}")]]) if ai.enabled() else None
         await ctx.bot.send_message(chat, msg, reply_markup=markup)
-        if res.lesson_topic:
-            await ctx.bot.send_message(chat, "Две ошибки подряд по этой теме — давай вспомним правило.\n\n" + LESSONS[res.lesson_topic])
+        if res.teach == "retell":
+            await ctx.bot.send_message(chat, "Ничего, попробуем по-другому 👇")
+            row = tr.s.one("SELECT ref FROM answers WHERE id=?", (res.aid,))
+            await send_story(ctx, chat, sid, {"topic": res.task.topic, "reason": "retell", "id": row["ref"]}, variant=2, extra=res.task.explanation)
+            tr.teach_retold(row["ref"])
+        elif res.teach == "adult":
+            await ctx.bot.send_message(chat, "Это непростая тема, и это нормально. Давай позовём взрослого: разберите вместе один пример "
+                                             "(минут 5). Мы вернёмся к этой теме завтра.")
     await send_next(ctx, chat, sid)
 
 
@@ -412,7 +456,8 @@ async def cmd_me(update: Update, ctx) -> None:
     day = tr.local(time.time()).date().isoformat()
     ov = [o for o in report.topic_overview(tr) if o["n"]]
     lines = [f"⭐ Очки: {x} — звание «{tr.title(x)}»", f"🔥 Серия: {tr.streak(day)} дн."]
-    lines += [f"{report._bar(o['acc'])} {round(o['acc'] * 100)}%  {o['name']}" for o in ov]
+    lines += [f"{tr.stars(o['topic'])} {round(o['acc'] * 100)}%  {o['name']}" + (" ✅ освоено" if tr.is_mastered(o["topic"]) else "") for o in ov]
+    lines.append("\nСтупени: ★ — начинаем, ★★ — уже уверенно, ★★★ — сложные задания.")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -466,6 +511,17 @@ async def cmd_name(update: Update, ctx) -> None:
         return
     T(ctx).s.set("child_name", name[:40])
     await update.message.reply_text(f"Теперь в отчётах: {name}")
+
+
+@parent_only
+async def cmd_gender(update: Update, ctx) -> None:
+    arg = " ".join(ctx.args).strip().lower()
+    g = {"мальчик": "boy", "м": "boy", "сын": "boy", "девочка": "girl", "д": "girl", "дочь": "girl", "нет": "none", "не указывать": "none"}.get(arg)
+    if not g:
+        await update.message.reply_text("Формат: /gender мальчик  (или девочка, или нет). От этого зависят образы в объяснениях.")
+        return
+    T(ctx).set_gender(g)
+    await update.message.reply_text("Записала: " + stories.GENDER_WORDS[g] + ". Объяснения будут с подходящими примерами.")
 
 
 @parent_only
@@ -644,6 +700,7 @@ def build_app() -> Application:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     store = Store(db_path)
     tr = Trainer(store, cfg)
+    tr.backfill_teaching()   # слабые темы уже пройденного среза знаний встанут в очередь на объяснение
     if (os.environ.get("START_TIME") or P.start_time) and not store.get("start_time"):
         store.set("start_time", os.environ.get("START_TIME") or P.start_time)
     if P.child_name and not store.get("child_name"):
@@ -652,7 +709,7 @@ def build_app() -> Application:
     app.bot_data["tr"] = tr
     for name, fn in [("start", cmd_start), ("go", cmd_go), ("myid", cmd_myid), ("help", cmd_help), ("stats", cmd_stats),
                      ("settime", cmd_settime), ("name", cmd_name), ("diag", cmd_diag), ("status", cmd_status), ("me", cmd_me),
-                     ("ask", cmd_ask), ("wallet", cmd_wallet), ("money", cmd_money), ("payout", cmd_payout), ("testmail", cmd_testmail), ("book", cmd_book), ("school", cmd_school), ("test", cmd_test), ("reward", cmd_reward)]:
+                     ("ask", cmd_ask), ("gender", cmd_gender), ("wallet", cmd_wallet), ("money", cmd_money), ("payout", cmd_payout), ("testmail", cmd_testmail), ("book", cmd_book), ("school", cmd_school), ("test", cmd_test), ("reward", cmd_reward)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

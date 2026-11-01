@@ -171,3 +171,20 @@ def test_validator_catches_problems():
         assert part in joined, part
     with pytest.raises(ValueError):
         packs.apply(bad)
+
+
+def test_pack_stories_validated_and_used(restore_packs):
+    from mathbot import stories
+    pack = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    pack["stories"] = {"to_be": {"rule": "I — am, he/she/it — is, we/you/they — are.", "steps": "1) Найди, кто делает. 2) Выбери am, is или are.",
+                                 "boy": {"hook": "Робот сообщает о себе: I am a robot.", "example": "He is a pilot."},
+                                 "girl": {"hook": "Подруга говорит: I am Anna.", "example": "She is my sister."}}}
+    assert packs.validate(pack)[0] == []
+    bad = json.loads(json.dumps(pack))
+    del bad["stories"]["to_be"]["girl"]["hook"]
+    bad["stories"]["zzz"] = {}
+    errs = "\n".join(packs.validate(bad)[0])
+    assert "stories.to_be.girl" in errs and "stories: неизвестная тема zzz" in errs
+    packs.apply(pack)
+    assert "Робот сообщает" in stories.render("to_be", "boy") and "Подруга говорит" in stories.render("to_be", "girl")
+    assert "Исследование" in stories.render("plurals", "boy")        # для темы без stories — мини-урок

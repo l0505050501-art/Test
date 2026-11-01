@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS answers (
   text TEXT, task_json TEXT, sent_at REAL, answered_at REAL, given TEXT, correct INTEGER, seconds REAL);
 CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, level INTEGER, stage INTEGER DEFAULT 0, due_at REAL, active INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS prereq (topic TEXT PRIMARY KEY, parent TEXT, state TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS teach (id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT, reason TEXT, prio TEXT, state TEXT, tries INTEGER DEFAULT 0, result TEXT, session_id INTEGER, created_at REAL);
 CREATE TABLE IF NOT EXISTS topic_state (topic TEXT PRIMARY KEY, level INTEGER DEFAULT 1, streak INTEGER DEFAULT 0);
 """
 
@@ -31,6 +32,7 @@ REVIEW_GAPS = [240, 22 * 3600, 70 * 3600, 6 * 86400]   # через скольк
 MASTER_ACC, MASTER_SECS = 7 / 8, 30                      # «освоено»: ≥7 из последних 8 верно и ≤30 с в среднем
 TITLES = [(0, "Новичок"), (150, "Счётчик"), (500, "Знаток"), (1200, "Эксперт"), (2500, "Мастер"), (5000, "Профессор")]
 BOOKS = {"vilenkin": "Виленкин", "merzlyak": "Мерзляк", "nikolsky": "Никольский", "dorofeev": "Дорофеев", "unknown": "не знаю / другой"}
+NOT_REAL = "COALESCE(tag,'') NOT IN ('check','skip')"   # не считаем проверочные после объяснения и автопропуски
 IDLE_CAP = 180             # секунд: дольше этого на один вопрос в «чистое время» не засчитываем
 
 
@@ -109,7 +111,7 @@ class Trainer:
     def diag_counts(self) -> dict[str, int]:
         rows = self.s.q(
             "SELECT a.topic, COUNT(*) c FROM answers a JOIN sessions s ON s.id=a.session_id "
-            "WHERE s.kind='diagnostic' AND a.answered_at IS NOT NULL GROUP BY a.topic")
+            "WHERE s.kind='diagnostic' AND a.answered_at IS NOT NULL AND COALESCE(a.tag,'')!='check' GROUP BY a.topic")
         res = {t: 0 for t in TOPICS}
         res.update({r["topic"]: r["c"] for r in rows})
         return res
@@ -138,6 +140,7 @@ class Trainer:
 
     def finish(self, sid: int, status: str, now: float) -> None:
         self.s.run("UPDATE sessions SET status=?, finished_at=? WHERE id=? AND status IN ('invited','active')", (status, now, sid))
+        self.s.run("UPDATE teach SET state='queued', prio='next', session_id=NULL WHERE session_id=? AND state IN ('await_check','checking','retell')", (sid,))
         if status in ("done", "partial"):
             self.detect_gaps(now)
 
@@ -248,6 +251,8 @@ class Trainer:
     def school_question(self, now: float) -> str | None:
         """Что бот должен спросить у ученика сейчас: book | topic | test | None."""
         week = "%d-W%02d" % self.local(now).isocalendar()[:2]
+        if not self.s.get("child_gender"):
+            return "gender"
         if not self.s.get("book"):
             return "book"
         if self.s.get("school_topic_week") != week:
@@ -315,7 +320,8 @@ class Trainer:
         return r["level"] if r else 1
 
     def _last(self, topic: str, n: int):
-        return self.s.q("SELECT correct, seconds FROM answers WHERE topic=? AND answered_at IS NOT NULL ORDER BY id DESC LIMIT ?", (topic, n))
+        return self.s.q(f"SELECT correct, seconds FROM answers WHERE topic=? AND answered_at IS NOT NULL AND {NOT_REAL} "
+                        "AND COALESCE(error_tag,'')!='nc' ORDER BY id DESC LIMIT ?", (topic, n))
 
     def _accuracy(self, topic: str) -> float:
         rows = self._last(topic, 12)
@@ -358,7 +364,7 @@ class Trainer:
         return topic, self._topic_level(topic)
 
     def _pick_diag(self, sid: int) -> tuple[str, int] | None:
-        in_session = self.s.one("SELECT COUNT(*) c FROM answers WHERE session_id=?", (sid,))["c"]
+        in_session = self.s.one(f"SELECT COUNT(*) c FROM answers WHERE session_id=? AND {NOT_REAL}", (sid,))["c"]
         if in_session >= DIAG_CHUNK:
             return None
         for topic, n in self.diag_counts().items():
@@ -398,7 +404,10 @@ class Trainer:
         pending = self.pending(sid)
         if pending:
             return pending
-        done = self.s.one("SELECT COUNT(*) c FROM answers WHERE session_id=?", (sid,))["c"]
+        chk = self._teach_check(sid, now, rnd)
+        if chk:
+            return chk
+        done = self.s.one(f"SELECT COUNT(*) c FROM answers WHERE session_id=? AND {NOT_REAL}", (sid,))["c"]
         tag = ref = None
         if s["kind"] == "diagnostic":
             pick = self._pick_diag(sid)
@@ -456,28 +465,53 @@ class Trainer:
             return Result(None, None)
         return self._record(sid, row, Task.load(row["task_json"]), False, "не знаю", now, idk=True)
 
-    def _record(self, sid: int, row, task: Task, ok: bool, text: str, now: float, idk: bool = False) -> "Result":
+    def not_covered(self, sid: int, now: float) -> "Result":
+        """Кнопка «Не проходили»: тема в школе ещё не изучалась. Это не ошибка и не пробел, а повод объяснить с нуля."""
+        row = self.pending(sid)
+        if not row:
+            return Result(None, None)
+        return self._record(sid, row, Task.load(row["task_json"]), False, "не проходили", now, nc=True)
+
+    def _record(self, sid: int, row, task: Task, ok: bool, text: str, now: float, idk: bool = False, nc: bool = False) -> "Result":
         secs = max(0.0, now - row["sent_at"])
-        err = None if ok else ("idk" if idk else match_trap(task, text))
+        err = None if ok else ("nc" if nc else "idk" if idk else match_trap(task, text))
         self.s.run("UPDATE answers SET answered_at=?, given=?, correct=?, seconds=?, error_tag=? WHERE id=?",
                    (now, text[:200], int(ok), secs, err, row["id"]))
         self.s.run("UPDATE sessions SET last_activity=? WHERE id=?", (now, sid))
         kind = self.session(sid)["kind"]
-        self._update_level(task, ok, sid, row["tag"])
-        self._review_update(row, task, ok, now, kind)
-        reward = self.reward_for(ok, secs, sid)
+        if nc and kind == "diagnostic":     # тема не изучалась — остальные вопросы этой темы в срезе пропускаем
+            have = self.s.one("SELECT COUNT(*) c FROM answers a JOIN sessions s ON s.id=a.session_id WHERE s.kind='diagnostic' AND a.topic=? "
+                              "AND a.answered_at IS NOT NULL AND COALESCE(a.tag,'')!='check'", (task.topic,))["c"]
+            for i in range(max(0, DIAG_PER_TOPIC - have)):
+                self.s.run("INSERT INTO answers(session_id,seq,topic,level,text,task_json,sent_at,answered_at,given,correct,seconds,tag,error_tag,reward) "
+                           "VALUES(?,?,?,?,?,?,?,?,?,0,0,'skip','nc',0)",
+                           (sid, 0, task.topic, task.level + i + 1, "(пропуск: тема не изучалась)", "{}", now, now, "не проходили"))
+        if not nc:
+            self._update_level(task, ok, sid, row["tag"])
+            self._review_update(row, task, ok, now, kind)
+        elif kind == "diagnostic":
+            self._update_level(task, ok, sid, row["tag"])
+        reward = 0 if nc else self.reward_for(ok, secs, sid)
         self.s.run("UPDATE answers SET reward=? WHERE id=?", (reward, row["id"]))
         res = Result(ok, task, tag=err, aid=row["id"])
+        res.nc = nc
         res.money = reward
         res.hint = TAGS[err][0] if err and err != "idk" else None
         res.xp = (10 + (5 if secs <= 15 else 0)) if ok else 0
         self.add_xp(res.xp)
-        if not ok and kind == "daily":
-            last2 = self.s.q("SELECT correct FROM answers WHERE session_id=? AND topic=? AND answered_at IS NOT NULL ORDER BY id DESC LIMIT 2", (sid, task.topic))
+        if row["tag"] == "check":
+            res.teach = self._teach_result(row, ok, now)
+        elif nc and kind != "diagnostic":
+            self.teach_enqueue(task.topic, "nc", "now")
+        elif idk and kind == "daily":
+            self.teach_enqueue(task.topic, "idk", "now")
+        if not ok and not nc and kind == "daily" and row["tag"] != "check":
+            last2 = self.s.q(f"SELECT correct FROM answers WHERE session_id=? AND topic=? AND answered_at IS NOT NULL AND {NOT_REAL} ORDER BY id DESC LIMIT 2", (sid, task.topic))
             key = f"lesson_sess_{sid}_{task.topic}"
             if len(last2) == 2 and not any(r["correct"] for r in last2) and not self.s.get(key):
                 self.s.set(key, "1")
                 res.lesson_topic = task.topic
+                self.teach_enqueue(task.topic, "wrong2", "now")
         flag = f"mastered_{task.topic}"
         if self.is_mastered(task.topic):
             if not self.s.get(flag):
@@ -489,6 +523,8 @@ class Trainer:
         return res
 
     def _review_update(self, row, task: Task, ok: bool, now: float, kind: str) -> None:
+        if row["tag"] == "check":
+            return
         if row["tag"] == "review" and row["ref"]:
             rv = self.s.one("SELECT * FROM reviews WHERE id=?", (row["ref"],))
             if not rv:
@@ -513,6 +549,8 @@ class Trainer:
 
     def _update_level(self, task: Task, ok: bool, sid: int, tag: str | None = None) -> None:
         s = self.session(sid)
+        if tag == "check":
+            return
         if tag == "probe":
             rows = self.s.q("SELECT correct FROM answers WHERE tag='probe' AND topic=? AND answered_at IS NOT NULL", (task.topic,))
             if len(rows) >= 3:
@@ -524,7 +562,9 @@ class Trainer:
         if s["kind"] == "diagnostic":
             rows = self.s.q(
                 "SELECT a.correct FROM answers a JOIN sessions s ON s.id=a.session_id "
-                "WHERE s.kind='diagnostic' AND a.topic=? AND a.answered_at IS NOT NULL", (task.topic,))
+                "WHERE s.kind='diagnostic' AND a.topic=? AND a.answered_at IS NOT NULL AND COALESCE(a.tag,'')!='check'", (task.topic,))
+            if len(rows) == DIAG_PER_TOPIC:
+                self._diag_topic_done(sid, task.topic)
             if len(rows) >= DIAG_PER_TOPIC:
                 c = sum(r["correct"] for r in rows)
                 lvl = 1 if c <= 1 else 2 if c == 2 else 3
@@ -535,7 +575,7 @@ class Trainer:
         level, streak = (r["level"], r["streak"]) if r else (task.level, 0)
         if ok:
             streak = max(streak, 0) + 1
-            if streak >= 4 and level < 3:
+            if streak >= (3 if level == 1 else 4) and level < 3:
                 level, streak = level + 1, 0
         else:
             streak = min(streak, 0) - 1
@@ -561,10 +601,121 @@ class Trainer:
 
     def should_finish(self, sid: int, now: float) -> bool:
         s = self.session(sid)
-        done = self.s.one("SELECT COUNT(*) c FROM answers WHERE session_id=? AND answered_at IS NOT NULL", (sid,))["c"]
+        done = self.s.one(f"SELECT COUNT(*) c FROM answers WHERE session_id=? AND answered_at IS NOT NULL AND {NOT_REAL}", (sid,))["c"]
         if s["kind"] == "diagnostic":
             return done >= DIAG_CHUNK or self._pick_diag(sid) is None
         return self._time_up(s, done, now)
+
+    # ------------------------------------------------------------ обучение: «исследование» → проверка → понял / объясняем по-другому
+    def gender(self) -> str | None:
+        return self.s.get("child_gender")
+
+    def set_gender(self, g: str) -> None:
+        self.s.set("child_gender", g if g in ("boy", "girl", "none") else "none")
+
+    def stars(self, topic: str) -> str:
+        lvl = self._topic_level(topic)
+        return "★" * lvl + "☆" * (3 - lvl)
+
+    def teach_open(self, sid: int):
+        return self.s.one("SELECT * FROM teach WHERE session_id=? AND state IN ('await_check','checking','retell') ORDER BY id DESC LIMIT 1", (sid,))
+
+    def teach_enqueue(self, topic: str, reason: str, prio: str = "now") -> None:
+        ex = self.s.one("SELECT id, prio FROM teach WHERE topic=? AND state IN ('queued','await_check','checking','retell')", (topic,))
+        if ex:
+            if prio == "now" and ex["prio"] != "now":
+                self.s.run("UPDATE teach SET prio='now' WHERE id=?", (ex["id"],))
+            return
+        self.s.run("INSERT INTO teach(topic,reason,prio,state,created_at) VALUES(?,?,?,'queued',?)", (topic, reason, prio, time.time()))
+
+    def teach_due(self, sid: int, now: float):
+        """Какую тему объяснять прямо сейчас (или None). Не больше 3 объяснений за занятие (2 — на срезе знаний)."""
+        if self.teach_open(sid):
+            return None
+        kind = self.session(sid)["kind"]
+        started = self.s.one("SELECT COUNT(*) c FROM teach WHERE session_id=?", (sid,))["c"]
+        if started >= (2 if kind == "diagnostic" else 3):
+            return None
+        row = self.s.one("SELECT * FROM teach WHERE state='queued' AND prio='now' ORDER BY id LIMIT 1")
+        if not row:
+            done = self.s.one(f"SELECT COUNT(*) c FROM answers WHERE session_id=? AND {NOT_REAL}", (sid,))["c"]
+            if done == 0:
+                row = self.s.one("SELECT * FROM teach WHERE state='queued' ORDER BY id LIMIT 1")
+        return row
+
+    def teach_start(self, sid: int, tid: int) -> None:
+        self.s.run("UPDATE teach SET state='await_check', session_id=?, tries=0 WHERE id=?", (sid, tid))
+
+    def teach_retold(self, tid: int) -> None:
+        """Второе объяснение отправлено — нужна вторая проверка."""
+        self.s.run("UPDATE teach SET state='await_check' WHERE id=?", (tid,))
+
+    def _teach_check(self, sid: int, now: float, rnd=None):
+        t = self.s.one("SELECT * FROM teach WHERE session_id=? AND state='await_check' ORDER BY id LIMIT 1", (sid,))
+        if not t:
+            return None
+        done = self.s.one("SELECT COUNT(*) c FROM answers WHERE session_id=?", (sid,))["c"]
+        avoid = {r["text"] for r in self.s.q("SELECT text FROM answers WHERE session_id=?", (sid,))}
+        task = make_task(t["topic"], 1, rnd or random, avoid)
+        aid = self.s.run("INSERT INTO answers(session_id,seq,topic,level,text,task_json,sent_at,tag,ref) VALUES(?,?,?,?,?,?,?,'check',?)",
+                         (sid, done + 1, task.topic, task.level, task.text, task.dump(), now, t["id"]))
+        self.s.run("UPDATE teach SET state='checking' WHERE id=?", (t["id"],))
+        return self.s.one("SELECT * FROM answers WHERE id=?", (aid,))
+
+    def _teach_result(self, row, ok: bool, now: float) -> str | None:
+        t = self.s.one("SELECT * FROM teach WHERE id=?", (row["ref"],))
+        if not t:
+            return None
+        if ok:
+            self.s.run("UPDATE teach SET state='done', result='ok' WHERE id=?", (t["id"],))
+            return "understood"
+        if t["tries"] == 0:
+            self.s.run("UPDATE teach SET state='retell', tries=1 WHERE id=?", (t["id"],))
+            return "retell"
+        self.s.run("UPDATE teach SET state='done', result='help', tries=2 WHERE id=?", (t["id"],))
+        ex = self.s.one("SELECT id FROM reviews WHERE active=1 AND topic=?", (t["topic"],))
+        due = now + REVIEW_GAPS[1]
+        if ex:
+            self.s.run("UPDATE reviews SET stage=0, due_at=? WHERE id=?", (due, ex["id"]))
+        else:
+            self.s.run("INSERT INTO reviews(topic,level,stage,due_at) VALUES(?,1,0,?)", (t["topic"], due))
+        return "adult"
+
+    def _diag_topic_done(self, sid: int, topic: str) -> None:
+        """Тема в срезе закончена: если слабо — поставить в очередь объяснение."""
+        rows = self.s.q("SELECT a.correct, a.error_tag FROM answers a JOIN sessions s ON s.id=a.session_id "
+                        "WHERE s.kind='diagnostic' AND a.topic=? AND a.answered_at IS NOT NULL AND COALESCE(a.tag,'')!='check'", (topic,))
+        nc = sum(1 for r in rows if r["error_tag"] == "nc")
+        idk = sum(1 for r in rows if r["error_tag"] == "idk")
+        wrong = sum(1 for r in rows if not r["correct"])
+        if nc or idk or wrong >= 2:
+            started = self.s.one("SELECT COUNT(*) c FROM teach WHERE session_id=?", (sid,))["c"]
+            pending_now = self.s.one("SELECT COUNT(*) c FROM teach WHERE state='queued' AND prio='now'")["c"]
+            self.teach_enqueue(topic, "nc" if nc else "diag_weak", "now" if started + pending_now < 2 else "next")
+
+    def backfill_teaching(self) -> int:
+        """Один раз после обновления: слабые темы уже пройденного среза знаний ставим в очередь на объяснение."""
+        if self.s.get("teach_backfilled"):
+            return 0
+        n = 0
+        for topic in TOPICS:
+            rows = self.s.q("SELECT a.correct, a.error_tag FROM answers a JOIN sessions s ON s.id=a.session_id "
+                            "WHERE s.kind='diagnostic' AND a.topic=? AND a.answered_at IS NOT NULL AND COALESCE(a.tag,'')!='check'", (topic,))
+            if len(rows) >= DIAG_PER_TOPIC and not self.s.one("SELECT 1 FROM teach WHERE topic=?", (topic,)):
+                wrong = sum(1 for r in rows if not r["correct"])
+                if wrong >= 2 or any(r["error_tag"] in ("nc", "idk") for r in rows):
+                    self.teach_enqueue(topic, "nc" if any(r["error_tag"] == "nc" for r in rows) else "diag_weak", "next")
+                    n += 1
+        self.s.set("teach_backfilled", "1")
+        return n
+
+    def teach_report(self, sid: int) -> dict:
+        rows = self.s.q("SELECT * FROM teach WHERE session_id=? ORDER BY id", (sid,))
+        return {"ok": [r["topic"] for r in rows if r["result"] == "ok"], "help": [r["topic"] for r in rows if r["result"] == "help"],
+                "queued": [r["topic"] for r in self.s.q("SELECT topic FROM teach WHERE state='queued' ORDER BY id")]}
+
+    def not_covered_topics(self) -> list[str]:
+        return [r["topic"] for r in self.s.q("SELECT DISTINCT topic FROM answers WHERE error_tag='nc' ORDER BY id")]
 
     def reset_diagnostic(self) -> None:
         """Начать срез знаний заново: старые ответы остаются в истории, но в расчёт среза не идут."""
@@ -583,6 +734,8 @@ class Result:
     lesson_topic: str | None = None
     mastered: str | None = None
     aid: int | None = None     # id строки answers
+    nc: bool = False           # нажато «Не проходили»
+    teach: str | None = None   # результат проверки после объяснения: understood | retell | adult
     money: int = 0             # заработано за этот ответ
 
     def __iter__(self):        # совместимость: ok, task, bad = tr.submit(...)

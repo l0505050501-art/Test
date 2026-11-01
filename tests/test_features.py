@@ -132,6 +132,8 @@ def test_mastery_and_school_topic_boost():
 def test_school_questions_asked_in_order_and_weekly():
     tr = make()
     now = ts(2, 17)           # понедельник
+    assert tr.school_question(now) == "gender"
+    tr.set_gender("girl")
     assert tr.school_question(now) == "book"
     tr.set_book("merzlyak")
     assert tr.school_question(now) == "topic"

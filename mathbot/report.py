@@ -34,10 +34,18 @@ def label(acc: float) -> str:
 
 def session_stats(t: Trainer, sid: int) -> dict:
     s = t.session(sid)
-    rows = t.s.q("SELECT * FROM answers WHERE session_id=? AND answered_at IS NOT NULL ORDER BY seq", (sid,))
+    allrows = t.s.q("SELECT * FROM answers WHERE session_id=? AND answered_at IS NOT NULL ORDER BY id", (sid,))
+    real = [r for r in allrows if r["tag"] not in ("check", "skip")]
+    checks = [r for r in allrows if r["tag"] == "check"]
+    nc_topics = []
+    for r in allrows:
+        if r["error_tag"] == "nc" and r["topic"] not in nc_topics:
+            nc_topics.append(r["topic"])
+    rows = [r for r in real if r["error_tag"] != "nc"]          # задания, на которые ребёнок ответил
     n = len(rows)
     ok = sum(r["correct"] for r in rows)
-    active = sum(min(r["seconds"], IDLE_CAP) for r in rows)
+    spent = rows + checks
+    active = sum(min(r["seconds"], IDLE_CAP) for r in spent)
     by_topic: dict[str, dict] = {}
     for r in rows:
         d = by_topic.setdefault(r["topic"], {"n": 0, "ok": 0, "sec": 0.0})
@@ -45,16 +53,17 @@ def session_stats(t: Trainer, sid: int) -> dict:
         d["ok"] += r["correct"]
         d["sec"] += min(r["seconds"], IDLE_CAP)
     errors = [r for r in rows if not r["correct"]]
-    slow = [r for r in rows if r["seconds"] > 60]
+    slow = [r for r in spent if r["seconds"] > 60]
     reaction = (s["started_at"] - s["invited_at"]) if s["started_at"] and s["invited_at"] else None
     wall = (s["finished_at"] - s["started_at"]) if s["finished_at"] and s["started_at"] else None
     tags = Counter(r["error_tag"] for r in errors if r["error_tag"])
     rev = [r for r in rows if r["tag"] == "review"]
-    xp = sum((10 + (5 if r["seconds"] <= 15 else 0)) for r in rows if r["correct"])
+    xp = sum((10 + (5 if r["seconds"] <= 15 else 0)) for r in spent if r["correct"])
     return {"tags": tags, "rev_n": len(rev), "rev_ok": sum(r["correct"] for r in rev), "xp": xp,
             "s": s, "rows": rows, "n": n, "ok": ok, "wrong": n - ok, "active": active,
-            "avg": active / n if n else 0, "by_topic": by_topic, "errors": errors, "slow": slow,
-            "reaction": reaction, "wall": wall}
+            "avg": active / len(spent) if spent else 0, "by_topic": by_topic, "errors": errors, "slow": slow,
+            "reaction": reaction, "wall": wall, "nc_topics": nc_topics,
+            "checks_n": len(checks), "checks_ok": sum(r["correct"] for r in checks)}
 
 
 def streak_days(t: Trainer, upto_day: str) -> int:
@@ -66,8 +75,11 @@ def diagnostic_summary(t: Trainer) -> list[dict]:
     for topic, name in TOPICS.items():
         rows = t.s.q(
             "SELECT a.level, a.correct, a.seconds FROM answers a JOIN sessions s ON s.id=a.session_id "
-            "WHERE s.kind='diagnostic' AND a.topic=? AND a.answered_at IS NOT NULL ORDER BY a.id", (topic,))
-        if rows:
+            "WHERE s.kind='diagnostic' AND a.topic=? AND a.answered_at IS NOT NULL AND COALESCE(a.tag,'')!='check' "
+            "AND COALESCE(a.error_tag,'')!='nc' ORDER BY a.id", (topic,))
+        if t.s.one("SELECT 1 FROM answers a JOIN sessions s ON s.id=a.session_id WHERE s.kind='diagnostic' AND a.topic=? AND a.error_tag='nc'", (topic,)):
+            res.append({"topic": topic, "name": name, "n": 0, "ok": 0, "acc": 0.0, "avg": 0, "nc": True})
+        elif rows:
             ok = sum(r["correct"] for r in rows)
             res.append({"topic": topic, "name": name, "n": len(rows), "ok": ok, "acc": ok / len(rows),
                         "avg": sum(min(r["seconds"], IDLE_CAP) for r in rows) / len(rows)})
@@ -82,7 +94,8 @@ def topic_overview(t: Trainer) -> list[dict]:
     for topic, name in ALL_TOPICS.items():
         if topic not in TOPICS and not t.s.one("SELECT 1 FROM prereq WHERE topic=? AND state IN ('active','done')", (topic,)):
             continue
-        rows = t.s.q("SELECT correct FROM answers WHERE topic=? AND answered_at IS NOT NULL ORDER BY id DESC LIMIT 15", (topic,))
+        rows = t.s.q("SELECT correct FROM answers WHERE topic=? AND answered_at IS NOT NULL AND COALESCE(tag,'') NOT IN ('check','skip') "
+                     "AND COALESCE(error_tag,'')!='nc' ORDER BY id DESC LIMIT 15", (topic,))
         st = t.s.one("SELECT level FROM topic_state WHERE topic=?", (topic,))
         n = len(rows)
         acc = sum(r["correct"] for r in rows) / n if n else 0
@@ -142,6 +155,20 @@ def extras_text(t: Trainer, st: dict) -> list[str]:
             a, b = t.session_earned(s["id"])
             lines.append(f"💰 Заработано за занятие: {t.fmt(a + b)}" + (f" (бонус за полное занятие и освоение: {t.fmt(b)})" if b else "")
                          + f". К выплате сейчас: {t.fmt(t.balance())} (отметить выплату: /payout)")
+    if st["nc_topics"]:
+        lines += ["", "📚 Не проходили в школе (по ответам ребёнка): " + "; ".join(ALL_TOPICS[x] for x in st["nc_topics"]) + ". Это не ошибка: бот объяснил тему с нуля."]
+    tp = t.teach_report(s["id"])
+    if tp["ok"] or tp["help"] or st["checks_n"]:
+        lines += ["", "🔎 Объяснения в этом занятии:"]
+        if tp["ok"]:
+            lines.append("  ✅ понял после объяснения: " + "; ".join(ALL_TOPICS[x] for x in tp["ok"]))
+        if tp["help"]:
+            lines.append("  ⚠️ нужна ваша помощь (не получилось после двух объяснений): " + "; ".join(ALL_TOPICS[x] for x in tp["help"])
+                         + ". Посидите 5 минут вместе: попросите ребёнка объяснить решение вслух.")
+        if st["checks_n"]:
+            lines.append(f"  проверочные задания после объяснения: верно {st['checks_ok']} из {st['checks_n']}")
+    if tp["queued"]:
+        lines.append("  ⏳ ждут разбора на ближайших занятиях: " + "; ".join(ALL_TOPICS[x] for x in tp["queued"][:5]))
     note = t.s.get(f"reward_note_{s['id']}")
     if note:
         lines += ["", note]
@@ -161,7 +188,7 @@ def advice(t: Trainer) -> str:
         return "Пока мало данных для совета."
     weak = min(ov, key=lambda o: o["acc"])
     tags = Counter(r["error_tag"] for r in t.s.q(
-        "SELECT error_tag FROM answers WHERE topic=? AND correct=0 AND error_tag IS NOT NULL AND error_tag!='idk' ORDER BY id DESC LIMIT 20", (weak["topic"],)))
+        "SELECT error_tag FROM answers WHERE topic=? AND correct=0 AND error_tag IS NOT NULL AND error_tag NOT IN ('idk','nc') ORDER BY id DESC LIMIT 20", (weak["topic"],)))
     msg = f"Совет на неделю: тема «{weak['name']}» ({round(weak['acc'] * 100)}%)."
     if tags:
         msg += f" Чаще всего ребёнок {TAGS[tags.most_common(1)[0][0]][1]}. Уделите этому 5 минут вместе: попросите объяснить решение вслух."
@@ -178,9 +205,9 @@ def build_session_report(t: Trainer, sid: int, child_name: str = "") -> tuple[st
     kind = "Срез знаний" if s["kind"] == "diagnostic" else "Ежедневная тренировка"
     title = f"{kind} · {name} · {s['day']}"
     if st["n"]:
-        subj = f"{P.subject_nom.capitalize()}, {name}: {st['ok']} из {st['n']} верно, {mmss(st['active'])} мин ({SHORT[s['status']]})"
+        subj = f"{P.subject_nom.capitalize()}, {name}: {st['ok']} из {st['n']} верно, {mmss(st['active'])} мин ({SHORT.get(s['status'], s['status'])})"
     else:
-        subj = f"{P.subject_nom.capitalize()}, {name}: {SHORT[s['status']]}"
+        subj = f"{P.subject_nom.capitalize()}, {name}: {SHORT.get(s['status'], s['status'])}"
 
     lines: list[str] = [title, "", STATUS[s["status"]], ""]
     if st["reaction"] is not None:
@@ -188,7 +215,8 @@ def build_session_report(t: Trainer, sid: int, child_name: str = "") -> tuple[st
     if st["n"]:
         lines += [
             f"Заданий выдано и решено: {st['n']}",
-            f"Верно: {st['ok']}   Ошибок: {st['wrong']}   Точность: {round(100 * st['ok'] / st['n'])}%",
+            f"Верно: {st['ok']}   Ошибок: {st['wrong']}   Точность: {round(100 * st['ok'] / st['n'])}%"
+            + (f"   Не проходили: {len(st['nc_topics'])} тем" if st["nc_topics"] else ""),
             f"Время решения (без пауз): {mmss(st['active'])} мин; в среднем {mmss(st['avg'])} на задание",
         ]
         if st["wall"]:
@@ -209,12 +237,14 @@ def build_session_report(t: Trainer, sid: int, child_name: str = "") -> tuple[st
     if s["kind"] == "diagnostic":
         lines += ["", "СРЕЗ ЗНАНИЙ (накопительно по темам):"]
         for d in diagnostic_summary(t):
-            if d["n"]:
+            if d.get("nc"):
+                lines.append(f"  📚 {d['name']} — ещё не проходили в школе (бот объяснит с нуля)")
+            elif d["n"]:
                 lines.append(f"  {_bar(d['acc'])} {round(d['acc'] * 100):>3}%  {d['name']} ({d['ok']}/{d['n']}) — {label(d['acc'])}")
             else:
                 lines.append(f"  ░░░░░░░░░░  --  {d['name']} — ещё не проверяли")
         if t.diagnostic_done():
-            weak = [d['name'] for d in diagnostic_summary(t) if d['acc'] < 0.6]
+            weak = [d['name'] for d in diagnostic_summary(t) if d['n'] and d['acc'] < 0.6]
             lines.append("")
             lines.append("Срез завершён. Начиная со следующего занятия бот чаще даёт слабые темы." +
                          (f" Западают: {'; '.join(weak)}." if weak else " Серьёзных провалов нет."))
@@ -256,7 +286,9 @@ def _html(title: str, text: str, st: dict, s, t: Trainer) -> str:
     if s["kind"] == "diagnostic":
         parts.append("<h3>Срез знаний по темам</h3><table cellpadding='5' style='border-collapse:collapse;border:1px solid #ccc'>")
         for d in diagnostic_summary(t):
-            if d["n"]:
+            if d.get("nc"):
+                parts.append(f"<tr><td>{e(d['name'])}</td><td colspan=2 style='color:#06c'>ещё не проходили в школе</td></tr>")
+            elif d["n"]:
                 color = "#2a8" if d["acc"] >= 0.85 else "#e90" if d["acc"] >= 0.6 else "#c33"
                 parts.append(f"<tr><td>{e(d['name'])}</td><td style='color:{color}'><b>{round(d['acc'] * 100)}%</b> ({d['ok']}/{d['n']})</td><td>{label(d['acc'])}</td></tr>")
             else:
@@ -285,7 +317,7 @@ def build_weekly(t: Trainer, today: str, child_name: str = "") -> tuple[str, str
         tot_ok += st["ok"]
         tot_sec += st["active"]
         done_days += s["status"] in ("done", "partial")
-        short = SHORT[s["status"]]
+        short = SHORT.get(s["status"], {"invited": "ждёт", "active": "идёт"}.get(s["status"], s["status"]))
         lines.append(f"  {day}: {short}" + (f" · {st['ok']}/{st['n']} верно · {mmss(st['active'])}" if st["n"] else ""))
     lines += ["", f"Занимался(лась) дней: {done_days} из 7", f"Всего решено: {tot_n}, верно {tot_ok}" + (f" ({round(100 * tot_ok / tot_n)}%)" if tot_n else ""),
               f"Общее время: {mmss(tot_sec)} мин", "", "Темы сейчас:"]
@@ -306,6 +338,12 @@ def build_weekly(t: Trainer, today: str, child_name: str = "") -> tuple[str, str
     if t.money_cfg()["correct"]:
         wk = sum(t.earned_on(d) for d in days)
         lines += ["", f"💰 За неделю заработано: {t.fmt(wk)}. К выплате сейчас: {t.fmt(t.balance())}"]
+    nc = [ALL_TOPICS[x] for x in t.not_covered_topics() if x in ALL_TOPICS]
+    if nc:
+        lines += ["", "📚 Не проходили в школе (по ответам ребёнка): " + "; ".join(nc)]
+    helps = [ALL_TOPICS[r["topic"]] for r in t.s.q("SELECT topic FROM teach t WHERE result='help' AND state='done' AND id=(SELECT MAX(id) FROM teach WHERE topic=t.topic AND state='done') GROUP BY topic") if r["topic"] in ALL_TOPICS]
+    if helps:
+        lines += ["⚠️ Нужна помощь взрослого (бот объяснил дважды, но тема не далась): " + "; ".join(helps)]
     lines += ["", advice(t)]
     text = "\n".join(lines)
     body = "<html><body style='font-family:Arial,sans-serif'><pre style='font-size:14px'>" + html.escape(text) + "</pre></body></html>"

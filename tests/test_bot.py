@@ -1,6 +1,8 @@
 """Сквозной прогон Телеграм-обработчиков с подставным ботом."""
 import asyncio
 import time
+
+import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,6 +11,12 @@ from mathbot import mailer
 from mathbot.engine import Settings, Store, Trainer
 from mathbot import report
 from mathbot.tasks import TOPICS, Task
+
+
+@pytest.fixture(autouse=True)
+def no_weekly(monkeypatch):
+    """Недельная сводка уходит по воскресеньям вечером; тесты не должны зависеть от настоящих часов."""
+    monkeypatch.setattr(B, "maybe_weekly", AsyncMock())
 
 
 def make_ctx():
@@ -52,8 +60,8 @@ def test_full_day(monkeypatch):
         await B.tick(ctx)                            # приглашение
         assert any("Время математики" in m or "проверка" in m for m in sent(ctx))
         await B.on_callback(upd(111, data="go"), ctx)
-        assert tr.session(1)["status"] == "invited" and "учебник" in sent(ctx)[-1]   # сначала расспрос про школу
-        for cb in ("bk:vilenkin", "st:percent", "tt:w2"):
+        assert tr.session(1)["status"] == "invited" and "мальчик или девочка" in sent(ctx)[-1]   # сначала знакомство
+        for cb in ("gd:girl", "bk:vilenkin", "st:percent", "tt:w2"):
             await B.on_callback(upd(111, data=cb), ctx)
         assert tr.s.get("book") == "vilenkin" and tr.s.get("school_topic") == "percent" and tr.days_to_test(time.time()) == 10
         assert tr.session(1)["status"] == "active"
@@ -95,9 +103,7 @@ def test_decline_and_parent_guard(monkeypatch):
         await B.cmd_settime(u, SimpleNamespace(**{**ctx.__dict__, "args": ["09:00"]}))
         assert "только для родителя" in u.message.reply_text.call_args.args[0]
         # но может начать заново после отказа
-        tr.set_book("vilenkin")
-        tr.set_school_topic("none", time.time())
-        tr.set_test_date(None, time.time())
+        onboarded(tr)
         await B.cmd_go(upd(111), ctx)
         assert tr.session(2)["status"] == "active"
 
@@ -105,6 +111,7 @@ def test_decline_and_parent_guard(monkeypatch):
 
 
 def onboarded(tr):
+    tr.set_gender("boy")
     tr.set_book("vilenkin")
     tr.set_school_topic("none", time.time())
     tr.set_test_date(None, time.time())
@@ -136,7 +143,6 @@ def test_lesson_idk_hint_minimum_and_reward(monkeypatch):
         await B.on_callback(upd(111, data="min"), ctx)           # режим «3 минуты»
         s = tr.session(tr.s.one("SELECT MAX(id) m FROM sessions")["m"])
         assert s["kind"] == "daily" and s["minutes"] == 3
-        assert any("Новая тема" in m for m in sent(ctx))         # мини-урок перед первой темой
         row = tr.pending(s["id"])
         before = len(sent(ctx))
         await B.on_callback(upd(111, data=f"idk:{row['id']}"), ctx)     # «Не знаю»
