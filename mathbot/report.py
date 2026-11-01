@@ -302,23 +302,32 @@ def build_weekly(t: Trainer, today: str, child_name: str = "") -> tuple[str, str
     d0 = date.fromisoformat(today)
     days = [(d0 - timedelta(days=i)).isoformat() for i in range(6, -1, -1)]
     sess = t.s.q("SELECT * FROM sessions WHERE day>=? AND day<=? ORDER BY id", (days[0], days[-1]))
-    by_day = {x["day"]: x for x in sess}
+    by_day: dict[str, list] = {}
+    for x in sess:
+        by_day.setdefault(x["day"], []).append(x)
     lines = [f"Итоги недели · {child_name or 'Ученик'} · {days[0]} — {days[-1]}", ""]
     tot_n = tot_ok = 0
     tot_sec = 0.0
     done_days = 0
     for day in days:
-        s = by_day.get(day)
-        if not s:
+        ss = by_day.get(day)
+        if not ss:
             lines.append(f"  {day}: —")
             continue
-        st = session_stats(t, s["id"])
-        tot_n += st["n"]
-        tot_ok += st["ok"]
-        tot_sec += st["active"]
-        done_days += s["status"] in ("done", "partial")
-        short = SHORT.get(s["status"], {"invited": "ждёт", "active": "идёт"}.get(s["status"], s["status"]))
-        lines.append(f"  {day}: {short}" + (f" · {st['ok']}/{st['n']} верно · {mmss(st['active'])}" if st["n"] else ""))
+        stats = [session_stats(t, x["id"]) for x in ss]
+        n, ok, act = sum(st["n"] for st in stats), sum(st["ok"] for st in stats), sum(st["active"] for st in stats)
+        tot_n += n
+        tot_ok += ok
+        tot_sec += act
+        rounds = sum(1 for x in ss if x["status"] in ("done", "partial"))
+        done_days += bool(rounds)
+        main = ss[0]
+        short = SHORT.get(main["status"], {"invited": "ждёт", "active": "идёт"}.get(main["status"], main["status"]))
+        if rounds and main["status"] not in ("done", "partial"):
+            short = "выполнено"
+        lines.append(f"  {day}: {short}" + (f" · раундов: {rounds}" if rounds > 1 else "")
+                     + (f" · {ok}/{n} верно · {mmss(act)}" if n else "")
+                     + (f" · 💰 {t.fmt(t.earned_on(day))}" if n and t.money_cfg()["correct"] else ""))
     lines += ["", f"Занимался(лась) дней: {done_days} из 7", f"Всего решено: {tot_n}, верно {tot_ok}" + (f" ({round(100 * tot_ok / tot_n)}%)" if tot_n else ""),
               f"Общее время: {mmss(tot_sec)} мин", "", "Темы сейчас:"]
     for o in topic_overview(t):
@@ -348,3 +357,39 @@ def build_weekly(t: Trainer, today: str, child_name: str = "") -> tuple[str, str
     text = "\n".join(lines)
     body = "<html><body style='font-family:Arial,sans-serif'><pre style='font-size:14px'>" + html.escape(text) + "</pre></body></html>"
     return f"{P.subject_nom.capitalize()}, {child_name or 'ученик'}: итоги недели", text, body
+
+
+def build_day_summary(t: Trainer, day: str, child_name: str = "") -> tuple[str, str, str]:
+    """«Итоги дня»: все раунды за день (основное занятие и дополнительные) одним сообщением."""
+    sess = t.s.q("SELECT * FROM sessions WHERE day=? AND status IN ('done','partial') ORDER BY id", (day,))
+    stats = [session_stats(t, x["id"]) for x in sess]
+    name = child_name or "Ученик"
+    n, ok, act = sum(st["n"] for st in stats), sum(st["ok"] for st in stats), sum(st["active"] for st in stats)
+    extra = sum(1 for x in sess if x["extra"])
+    by_topic: dict[str, list] = {}
+    tags: Counter = Counter()
+    nc: list[str] = []
+    for st in stats:
+        for topic, d in st["by_topic"].items():
+            agg = by_topic.setdefault(topic, [0, 0])
+            agg[0] += d["ok"]
+            agg[1] += d["n"]
+        tags.update(st["tags"])
+        nc += [x for x in st["nc_topics"] if x not in nc]
+    lines = [f"Итоги дня · {name} · {day}", "",
+             f"Раундов: {len(sess)}" + (f" (основное занятие и ещё {extra} дополнительных — ребёнок сам захотел больше 👏)" if extra else ""),
+             f"Решено заданий: {n}, верно: {ok}" + (f" ({round(100 * ok / n)}%)" if n else ""),
+             f"Время решения: {mmss(act)} мин"]
+    if t.money_cfg()["correct"]:
+        lines.append(f"💰 Заработано за день: {t.fmt(t.earned_on(day))}. К выплате сейчас: {t.fmt(t.balance())} (отметить выплату: /payout)")
+    if by_topic:
+        lines += ["", "По темам за день:"]
+        for topic, (o, k) in sorted(by_topic.items(), key=lambda kv: kv[1][0] / kv[1][1] if kv[1][1] else 1):
+            lines.append(f"  • {ALL_TOPICS.get(topic, topic)}: {o}/{k} верно")
+    if tags:
+        lines += ["", "Типичные ошибки:"] + [f"  • {TAGS[tag][1]} — {c}" for tag, c in tags.most_common(3)]
+    if nc:
+        lines += ["", "📚 Не проходили в школе: " + "; ".join(ALL_TOPICS.get(x, x) for x in nc)]
+    text = "\n".join(lines)
+    body = "<html><body style='font-family:Arial,sans-serif'><pre style='font-size:14px;white-space:pre-wrap'>" + html.escape(text) + "</pre></body></html>"
+    return f"{P.subject_nom.capitalize()}, {name}: итоги дня — {ok} из {n} верно, раундов {len(sess)}", text, body

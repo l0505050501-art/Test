@@ -118,8 +118,8 @@ async def finish_session(ctx, chat: int, sid: int) -> None:
     s = tr.session(sid)
     streak = tr.streak(s["day"])
     cfg = tr.money_cfg()
-    if cfg["correct"] and not (s["minutes"] and s["minutes"] <= 3) and st["n"]:
-        tr.add_bonus(sid, cfg["session"])          # бонус за полностью пройденное занятие
+    if cfg["correct"] and tr.bonus_eligible(sid):
+        tr.add_bonus(sid, cfg["session"])          # бонус за полностью пройденное занятие (от 10 заданий)
     msg = f"🎉 Готово! Решено заданий: {st['n']}, верно: {st['ok']}.\nВремя: {report.mmss(st['active'])} мин.\n⭐ +{st['xp']} очков (всего {tr.xp()}, звание «{tr.title(tr.xp())}»)"
     if cfg["correct"]:
         ans, bonus = tr.session_earned(sid)
@@ -136,23 +136,25 @@ async def finish_session(ctx, chat: int, sid: int) -> None:
     reward = tr.reward_due(sid)
     if reward:
         msg += f"\n\n🏆 {reward[1]} дней подряд! Твоя награда: {reward[0]}"
-    msg += "\n\nДо завтра!" if s["kind"] == "daily" else "\n\nСпасибо! Завтра продолжим."
-    await ctx.bot.send_message(chat, msg)
+    msg += "\n\nХочешь заработать больше? Раундов можно делать сколько угодно 👇" if cfg["correct"] else "\n\nМожно сделать ещё раунд 👇"
+    again = Markup([[Btn("🔁 Ещё раунд", callback_data="go")]])
+    await ctx.bot.send_message(chat, msg, reply_markup=again)
     await send_report(ctx, sid)
 
 
-async def begin(ctx, chat: int, sid: int, minutes: int | None = None) -> None:
+async def begin(ctx, chat: int, sid: int, minutes: int | None = None, extra: bool = False) -> None:
     tr = T(ctx)
     tr.start(sid, time.time(), minutes)
     s = tr.session(sid)
     if s["kind"] == "diagnostic":
         done = sum(1 for c in tr.diag_counts().values() if c >= 3)
-        intro = (f"Сегодня небольшая проверка: посмотрим, что ты уже знаешь по темам {P.grade_gen} (тем проверено: {done} из {len(TOPICS)}). "
+        intro = (("Ещё раунд проверки! 💪 " if extra else "") + f"Сегодня небольшая проверка: посмотрим, что ты уже знаешь по темам {P.grade_gen} (тем проверено: {done} из {len(TOPICS)}). "
                  f"Ошибаться можно — это нужно только чтобы понять, с чего начать. Всё устно, калькулятор не нужен. Заданий: {DIAG_CHUNK}.\n"
                  "Если тему ещё не проходили — жми «📚 Не проходили». Если не знаешь — «🤷 Не знаю». Это совсем не страшно: "
                  "после проверки я объясню всё, что было трудно.")
     else:
-        intro = f"Поехали! Примерно {tr.minutes_for(s)} мин. устного счёта."
+        length = f"{tr.session_tasks()} заданий" if tr.session_tasks() and not minutes else f"примерно {tr.minutes_for(s)} мин."
+        intro = (f"Ещё раунд! 💪 Каждый верный ответ — это деньги. {length.capitalize()}" if extra else f"Поехали! {length.capitalize()}")
         days = tr.days_to_test(time.time())
         if days is not None and days <= 7:
             intro += f"\n📌 Контрольная через {days} дн. — потренируем и школьную тему."
@@ -203,6 +205,9 @@ def parse_date(arg: str, today: date) -> date | None:
 async def send_report(ctx, sid: int) -> None:
     """Отчёт уходит маме в Телеграм (если она нажала /start в боте) и на почту (если настроена)."""
     tr = T(ctx)
+    if tr.session(sid)["extra"]:
+        tr.mark_reported(sid)      # дополнительный раунд идёт в «итоги дня», а не отдельным сообщением
+        return
     name = tr.s.get("child_name", "") or ""
     subject, text, body = report.build_session_report(tr, sid, name)
     delivered = bool(tr.s.get(f"tg_reported_{sid}"))
@@ -218,6 +223,23 @@ async def send_report(ctx, sid: int) -> None:
         delivered = await mailer.send_email(subject, text, body) or delivered
     if delivered:
         tr.mark_reported(sid)    # иначе повторим позже: например, когда мама нажмёт /start
+
+
+async def send_day_summary(ctx, day: str) -> None:
+    tr = T(ctx)
+    subject, text, body = report.build_day_summary(tr, day, tr.s.get("child_name", "") or "")
+    delivered = False
+    p = parent_id(tr)
+    if p:
+        try:
+            await ctx.bot.send_message(p, text[:4000])
+            delivered = True
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось отправить итоги дня родителю")
+    if mailer.configured():
+        delivered = await mailer.send_email(subject, text, body) or delivered
+    if delivered:
+        tr.mark_summarized(day, time.time())
 
 
 async def maybe_weekly(ctx, tr: Trainer, now: float) -> None:
@@ -261,6 +283,8 @@ async def tick(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 if s["status"] == "partial":
                     await ctx.bot.send_message(chat, "Занятие завершено — пришлось остановиться. Завтра продолжим! 🙂")
                 await send_report(ctx, sid)
+        for day in tr.summary_due(now):
+            await send_day_summary(ctx, day)
         await maybe_weekly(ctx, tr, now)
     except Exception:  # noqa: BLE001
         log.exception("tick failed")
@@ -272,6 +296,7 @@ HELP_PARENT = (
     "/stats — итоги недели, уровень по темам и совет\n"
     "/settime 17:30 — во сколько присылать задания\n"
     "/name Маша — имя ученика в отчётах\n"
+    "/length 10 минут — длина одного раунда (/length 15 заданий — по числу заданий, например слов)\n"
     "/gender мальчик — пол ученика (образы в объяснениях: техника и игры / творчество и быт)\n"
     "/book Виленкин — учебник (если ученик не ответил)\n"
     "/school проценты — какую тему проходят в школе\n"
@@ -329,8 +354,9 @@ async def go(ctx, chat: int, minutes: int | None = None) -> None:
         else:
             await send_next(ctx, chat, s["id"])
         return
-    if s and s["status"] in ("done", "partial"):
-        await ctx.bot.send_message(chat, "Сегодня ты уже позанимался(ась) 👍 Следующая тренировка — завтра.")
+    if tr.has_finished_today(now):          # дополнительный раунд: можно сколько угодно, чем больше — тем лучше
+        sid = tr.create_session(now, extra=True)
+        await begin(ctx, chat, sid, minutes, extra=True)
         return
     what = tr.school_question(now)
     if what:   # сначала коротко расспросим про школу
@@ -511,6 +537,23 @@ async def cmd_name(update: Update, ctx) -> None:
         return
     T(ctx).s.set("child_name", name[:40])
     await update.message.reply_text(f"Теперь в отчётах: {name}")
+
+
+@parent_only
+async def cmd_length(update: Update, ctx) -> None:
+    tr = T(ctx)
+    m = re.fullmatch(r"(\d{1,3})\s*(мин\w*|задан\w*|слов\w*)?", " ".join(ctx.args).strip().lower())
+    if not m or int(m.group(1)) < 1:
+        await update.message.reply_text("Формат: /length 10 минут  или  /length 15 заданий (например, 10 слов за раунд).\n"
+                                        f"Сейчас: {tr.session_tasks()} заданий" if tr.session_tasks() else f"Формат: /length 10 минут  или  /length 15 заданий.\nСейчас: {tr.minutes_for({'minutes': None})} мин.")
+        return
+    n, unit = int(m.group(1)), m.group(2) or "мин"
+    if unit.startswith(("задан", "слов")):
+        tr.set_session_length(tasks=n)
+        await update.message.reply_text(f"Теперь один раунд — {n} заданий. Ребёнок может делать раундов сколько угодно.")
+    else:
+        tr.set_session_length(minutes=n)
+        await update.message.reply_text(f"Теперь один раунд — около {n} минут. Ребёнок может делать раундов сколько угодно.")
 
 
 @parent_only
@@ -709,7 +752,7 @@ def build_app() -> Application:
     app.bot_data["tr"] = tr
     for name, fn in [("start", cmd_start), ("go", cmd_go), ("myid", cmd_myid), ("help", cmd_help), ("stats", cmd_stats),
                      ("settime", cmd_settime), ("name", cmd_name), ("diag", cmd_diag), ("status", cmd_status), ("me", cmd_me),
-                     ("ask", cmd_ask), ("gender", cmd_gender), ("wallet", cmd_wallet), ("money", cmd_money), ("payout", cmd_payout), ("testmail", cmd_testmail), ("book", cmd_book), ("school", cmd_school), ("test", cmd_test), ("reward", cmd_reward)]:
+                     ("ask", cmd_ask), ("gender", cmd_gender), ("length", cmd_length), ("wallet", cmd_wallet), ("money", cmd_money), ("payout", cmd_payout), ("testmail", cmd_testmail), ("book", cmd_book), ("school", cmd_school), ("test", cmd_test), ("reward", cmd_reward)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

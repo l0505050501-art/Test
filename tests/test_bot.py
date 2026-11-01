@@ -76,9 +76,12 @@ def test_full_day(monkeypatch):
         assert emails and "верно" in emails[0][0]
         assert any(c.args[0] == 222 for c in ctx.bot.send_message.call_args_list)  # мама получила в телеграм
         assert tr.session(1)["reported"] == 1
-        # повторное «начать» в тот же день — вежливый отказ
+        # повторное «начать» в тот же день — дополнительный раунд (можно сколько угодно), отдельного отчёта нет
+        reports_before = len(emails)
         await B.cmd_go(upd(111), ctx)
-        assert "уже" in sent(ctx)[-1]
+        extra = tr.s.one("SELECT * FROM sessions ORDER BY id DESC LIMIT 1")
+        assert extra["extra"] == 1 and extra["status"] == "active" and "Ещё раунд" in sent(ctx)[-2]
+        assert len(emails) == reports_before
 
     asyncio.run(run())
 

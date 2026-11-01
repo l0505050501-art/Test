@@ -1,0 +1,18 @@
+# Несколько предметов = несколько ботов на одном сервере.
+# Для каждого предмета: свой бот в BotFather (свой токен), свой файл настроек и своя папка с данными.
+# Скопируйте .env.example в .env.math и .env.russian, в каждом укажите свой TELEGRAM_BOT_TOKEN,
+# а для второго предмета ещё PACK=packs/russian-6.json и PROFILE_PATH=profile.russian.json.
+services:
+  math:
+    build: .
+    restart: unless-stopped
+    env_file: .env.math
+    volumes:
+      - ./data/math:/data
+  russian:
+    build: .
+    restart: unless-stopped
+    env_file: .env.russian
+    volumes:
+      - ./data/russian:/data
+    # запуск: docker compose -f docker-compose.multi.example.yml up -d --build

@@ -33,6 +33,7 @@ MASTER_ACC, MASTER_SECS = 7 / 8, 30                      # «освоено»: �
 TITLES = [(0, "Новичок"), (150, "Счётчик"), (500, "Знаток"), (1200, "Эксперт"), (2500, "Мастер"), (5000, "Профессор")]
 BOOKS = {"vilenkin": "Виленкин", "merzlyak": "Мерзляк", "nikolsky": "Никольский", "dorofeev": "Дорофеев", "unknown": "не знаю / другой"}
 NOT_REAL = "COALESCE(tag,'') NOT IN ('check','skip')"   # не считаем проверочные после объяснения и автопропуски
+MIN_TASKS_BONUS = 10        # бонус «за полное занятие» даётся, только если решено не меньше стольких заданий
 IDLE_CAP = 180             # секунд: дольше этого на один вопрос в «чистое время» не засчитываем
 
 
@@ -41,7 +42,7 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
-        for table, col, typ in [("answers", "tag", "TEXT"), ("answers", "error_tag", "TEXT"), ("answers", "ref", "INTEGER"), ("answers", "reward", "INTEGER"), ("sessions", "bonus", "INTEGER"),
+        for table, col, typ in [("answers", "tag", "TEXT"), ("answers", "error_tag", "TEXT"), ("answers", "ref", "INTEGER"), ("answers", "reward", "INTEGER"), ("sessions", "bonus", "INTEGER"), ("sessions", "extra", "INTEGER"), ("sessions", "summarized", "INTEGER"),
                                 ("sessions", "minutes", "INTEGER")]:
             try:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
@@ -127,10 +128,48 @@ class Trainer:
         uh, um = map(int, self.cfg.invite_until.split(":"))
         return (hh, mm) <= (t.hour, t.minute) < (uh, um)
 
-    def create_session(self, now: float, status: str = "invited") -> int:
+    def create_session(self, now: float, status: str = "invited", extra: bool = False) -> int:
+        """extra=True — дополнительный раунд: отдельный отчёт не шлётся, он попадает в «итоги дня»."""
         kind = "daily" if self.diagnostic_done() else "diagnostic"
-        return self.s.run("INSERT INTO sessions(day,kind,status,invited_at,last_activity) VALUES(?,?,?,?,?)",
-                          (self.day_of(now), kind, status, now, now))
+        return self.s.run("INSERT INTO sessions(day,kind,status,invited_at,last_activity,extra,reported,summarized) VALUES(?,?,?,?,?,?,?,0)",
+                          (self.day_of(now), kind, status, now, now, int(extra), int(extra)))
+
+    def has_finished_today(self, now: float) -> bool:
+        return bool(self.s.one("SELECT 1 FROM sessions WHERE day=? AND status IN ('done','partial')", (self.day_of(now),)))
+
+    def bonus_eligible(self, sid: int) -> bool:
+        """Бонус за «полное занятие» — только за настоящее занятие (не мини-раунд ради бонуса)."""
+        s = self.session(sid)
+        n = self.s.one(f"SELECT COUNT(*) c FROM answers WHERE session_id=? AND answered_at IS NOT NULL AND {NOT_REAL} AND COALESCE(error_tag,'')!='nc'", (sid,))["c"]
+        return n >= MIN_TASKS_BONUS and not (s["minutes"] and s["minutes"] <= 3)
+
+    def session_tasks(self) -> int:
+        return int(self.s.get("session_tasks") or 0)
+
+    def set_session_length(self, minutes: int | None = None, tasks: int | None = None) -> None:
+        """Длина раунда: либо по времени (минуты), либо по числу заданий (например, 10 слов)."""
+        if minutes:
+            self.s.set("session_tasks", None)
+            self.cfg.session_minutes = minutes
+            self.s.set("session_minutes", str(minutes))
+        if tasks:
+            self.s.set("session_tasks", str(tasks))
+
+    def summary_due(self, now: float) -> list[str]:
+        """Дни, для которых пора отправить «итоги дня» (были дополнительные раунды). Не чаще раза в час."""
+        today = self.day_of(now)
+        hh, mm = map(int, self.cfg.invite_until.split(":"))
+        t = self.local(now)
+        after_cutoff = (t.hour, t.minute) >= (hh, mm)
+        days = [r["day"] for r in self.s.q("SELECT DISTINCT day FROM sessions WHERE extra=1 AND summarized=0 AND status IN ('done','partial')")]
+        days = sorted(d for d in days if d < today or after_cutoff)
+        if days and all(d == today for d in days) and now - float(self.s.get("last_summary_ts", "0")) < 3600:
+            return []
+        return days
+
+    def mark_summarized(self, day: str, now: float) -> None:
+        self.s.run("UPDATE sessions SET summarized=1 WHERE day=? AND extra=1", (day,))
+        self.s.set("last_summary_ts", str(now))
 
     def start(self, sid: int, now: float, minutes: int | None = None) -> None:
         self.s.run("UPDATE sessions SET status='active', started_at=?, last_activity=?, minutes=? WHERE id=?", (now, now, minutes, sid))
@@ -391,10 +430,13 @@ class Trainer:
         return self.s.one("SELECT * FROM reviews WHERE active=1 AND due_at<=? ORDER BY due_at LIMIT 1", (now,))
 
     def minutes_for(self, s) -> int:
-        return s["minutes"] or self.cfg.session_minutes
+        return s["minutes"] or int(self.s.get("session_minutes") or self.cfg.session_minutes)
 
     def _time_up(self, s, done: int, now: float) -> bool:
-        floor = 3 if s["minutes"] and s["minutes"] <= 3 else 5
+        short = bool(s["minutes"] and s["minutes"] <= 3)
+        if self.session_tasks() and not short:                   # раунд задан числом заданий (например, 10 слов)
+            return done >= min(self.session_tasks(), self.cfg.max_tasks)
+        floor = 3 if short else 5
         return done >= self.cfg.max_tasks or ((now - (s["started_at"] or now)) >= self.minutes_for(s) * 60 and done >= floor)
 
     def next_question(self, sid: int, now: float, rnd=None):
